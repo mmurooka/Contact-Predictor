@@ -1,7 +1,12 @@
-**/__pycache__
-runs/
-.vscode/
-debug/
-data/
-output/
+# Ignore everything by default
+*
 
+# But track these file types
+!*.sh
+!*.py
+
+# Don't ignore .gitignore itself
+!.gitignore
+
+# Don't ignore directories (so git can traverse them)
+!*/

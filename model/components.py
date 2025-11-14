@@ -193,12 +193,14 @@ class AttentionSplitter(nn.Module):
         return human_output, object_output
 
 class HumanContact3DPredictor(nn.Module):
-    def __init__(self, hC_sam_view_type, multiview_channels, threshold=0.3):
+    def __init__(self, hC_sam_view_type, multiview_channels, threshold=0.33):
         super(HumanContact3DPredictor, self).__init__()
         
         self.hC_sam_view_type = hC_sam_view_type
         self.multiview_channels = multiview_channels
         self.threshold = threshold
+
+        self.threshold_3d = 0.3
         
         metadata_root = './data'
         metadata_folder = HUMAN_VIEW_DICT[hC_sam_view_type]['folder']
@@ -240,9 +242,10 @@ class HumanContact3DPredictor(nn.Module):
         valid_vertices = view_count > 0
         pred_3d_contacts[valid_vertices] /= view_count[valid_vertices]
         
-        pred_3d_contacts = (pred_3d_contacts > self.threshold).to(dtype=dtype)
+        pred_3d_contacts_raw = pred_3d_contacts.to(dtype=dtype)# (pred_3d_contacts > self.threshold).to(dtype=dtype)
+        pred_3d_contacts = (pred_3d_contacts > self.threshold_3d).to(dtype=dtype)
         
-        return pred_3d_contacts
+        return pred_3d_contacts, pred_3d_contacts_raw
 
     def _process_view(self, view_seg_map, view_idx, batch_idx, pred_3d_contacts, view_count):
         device = view_seg_map.device

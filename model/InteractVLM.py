@@ -461,8 +461,10 @@ class InteractVLMForCausalLM(LlavaLlamaForCausalLM):
                 "pred_masks": pred_masks,
             }
             if self.hC_loss_weight > 0:
-                pred_human_3d_contacts = self.human_3d_contact_predictor(pred_masks, ds_name_list)
+                pred_human_3d_contacts, pred_human_3d_contacts_raw = self.human_3d_contact_predictor(pred_masks, ds_name_list)
                 result["pred_human_3d_contact"] = pred_human_3d_contacts
+                result["pred_human_3d_contacts_raw"] = pred_human_3d_contacts_raw
+
             if self.oC_loss_weight > 0:
                 pred_object_3d_contacts = self.object_3d_contact_predictor(pred_masks, ds_name_list, mask_paths_list)
                 result["pred_object_3d_contact"] = pred_object_3d_contacts
@@ -620,7 +622,7 @@ class InteractVLMForCausalLM(LlavaLlamaForCausalLM):
 
         if pred_masks[0].shape[0] > 0:
             if self.hC_loss_weight > 0 and 'hcontact' in contact_type:
-                pred_contact_3d = self.human_3d_contact_predictor(pred_masks)
+                pred_contact_3d, pred_contact_3d_raw = self.human_3d_contact_predictor(pred_masks)
             # Irrespective of the object contact type trained, during inference object mesh is used, hence object mesh 
             # predictor is used for object contact prediction
             elif self.oC_loss_weight > 0 and 'ocontact' in contact_type or 'oafford' in contact_type:
@@ -631,6 +633,7 @@ class InteractVLMForCausalLM(LlavaLlamaForCausalLM):
             "output_ids": output_ids,
             "pred_masks": pred_masks,
             "pred_contact_3d": pred_contact_3d,
+            "pred_contact_3d_raw": pred_contact_3d_raw
         }
         if self.use_uncertainty:
             result["uncertainty_maps"] = uncertainty_maps

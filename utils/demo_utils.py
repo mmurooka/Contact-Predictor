@@ -52,16 +52,21 @@ def process_smplx_mesh_with_contacts(contact_vertices_smplx, output_path, contac
     # Process contact vertices
     contact_vertices_smplx = contact_vertices_smplx.cpu().numpy() if torch.is_tensor(contact_vertices_smplx) else contact_vertices_smplx
     
-    # Initialize vertex colors (default to light grey)
-    vertex_colors = np.ones((vertices.shape[0], 3)) * 0.8  # Light grey
+    # Initialize vertex colors (default to a light green for the body)
+    body_color = np.array([190, 235, 190], dtype=np.float32) / 255.0
+    contact_color = np.array([255, 143, 41], dtype=np.float32) / 255.0  # vibrant orange highlight
+    N = vertices.shape[0]
+
+    # ✅ 正确的按顶点初始化：形状 (N,3)
+    vertex_colors = np.tile(body_color[None, :], (N, 1)) 
     
     # Apply contact coloring
     if contact_vertices_smplx is not None:
         if contact_vertices_smplx.shape[0] == vertices.shape[0]:
             # Contact vertices is a probability/mask for each vertex
             contact_mask = contact_vertices_smplx > contact_threshold
-            # Color contact vertices red
-            vertex_colors[contact_mask] = [1.0, 0.1, 0.1]  # Bright red
+            # Color contact vertices orange to make contact areas pop
+            vertex_colors[contact_mask] = list(contact_color)
             
             num_contact_vertices = np.sum(contact_mask)
         else:
@@ -77,7 +82,7 @@ def process_smplx_mesh_with_contacts(contact_vertices_smplx, output_path, contac
     # Save the colored mesh
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     colored_mesh.export(output_path)
-    print(f'Saved SMPLX body mesh with human contact vertices colored red: {output_path}')
+    print(f'Saved SMPLX body mesh with light-green body and orange contact vertices: {output_path}')
 
 
 def process_object_mesh_with_contacts(obj_path, contact_vertices, output_path, contact_threshold=0.5):
