@@ -4,6 +4,7 @@ import sys
 import glob
 import shutil
 import joblib as jl
+from pathlib import Path
 
 import cv2
 from PIL import Image
@@ -114,13 +115,19 @@ def main(args):
     
     print(f"Found {len(image_paths)} images to process")
     
-    # Create output directories
-    REALBASE='/data3/zihanwa3/_Robotics/_data'
-    vert_base = os.path.join(REALBASE, '_contact', args.tgt_name)# img_folder.replace('_img', 'vertices')#os.path.join(args.base_dir, "VERT")
-    vis_base = os.path.join(REALBASE, '_contact_vis', args.tgt_name)#os.path.join(args.base_dir, "VIS")
-    os.makedirs(vert_base, exist_ok=True)
+    # Create output directories under the CRISP repo by default.
+    repo_root = Path(__file__).resolve().parents[2]
+    default_vert_root = repo_root / "results" / "init" / "contacts"
+    default_vis_root = repo_root / "results" / "init" / "contact_vis"
+
+    vert_root = Path(os.getenv("CRISP_CONTACT_ROOT", str(default_vert_root)))
+    vis_root = Path(os.getenv("CRISP_CONTACT_VIS_ROOT", str(default_vis_root)))
+
+    vert_base = vert_root / args.tgt_name
+    vis_base = vis_root / args.tgt_name
+    vert_base.mkdir(parents=True, exist_ok=True)
     if args.save_vis:
-        os.makedirs(vis_base, exist_ok=True)
+        vis_base.mkdir(parents=True, exist_ok=True)
 
     # Create model
     tokenizer = AutoTokenizer.from_pretrained(
@@ -319,17 +326,17 @@ def main(args):
         
         # Save vertices
         # Create directory structure in VERT matching the source structure
-        vert_dir = os.path.join(vert_base, os.path.dirname(rel_path))
-        os.makedirs(vert_dir, exist_ok=True)
+        vert_dir = vert_base / os.path.dirname(rel_path)
+        vert_dir.mkdir(parents=True, exist_ok=True)
         
         # Save with same name as original image but with .npz extension
         base_name = os.path.splitext(os.path.basename(full_path))[0]
-        vert_path = os.path.join(vert_dir, f"{base_name}.npz")
+        vert_path = vert_dir / f"{base_name}.npz"
         
         # Convert to SMPLX format
         pred_contact_3d_smplx = convert_contacts(pred_contact_3d, smpl_to_smlpx_mapping)
         pred_contact_3d_raw_smplx = convert_contacts(pred_contact_3d_raw, smpl_to_smlpx_mapping)
-        np.savez(vert_path,
+        np.savez(str(vert_path),
                 pred_contact_3d_smplh=pred_contact_3d.cpu(),
                 pred_contact_3d_raw_smplh=pred_contact_3d_raw.cpu(),
                 pred_contact_3d_smplx=pred_contact_3d_smplx.cpu(),
@@ -342,8 +349,8 @@ def main(args):
             pred_masks = pred_masks[0]
             if pred_masks.shape[0] > 0:
                 # Create directory structure in VIS matching the source structure
-                vis_dir = os.path.join(vis_base, os.path.dirname(rel_path))
-                os.makedirs(vis_dir, exist_ok=True)
+                vis_dir = vis_base / os.path.dirname(rel_path)
+                vis_dir.mkdir(parents=True, exist_ok=True)
                 
                 overlay_images = []
                 for i, pred_mask in enumerate(pred_masks):
@@ -378,15 +385,15 @@ def main(args):
                     grid[h:, w:] = overlay_images[3]  # bottom-right
                     
                     # Save visualization
-                    vis_path = os.path.join(vis_dir, f"{base_name}_vis.jpg")
-                    cv2.imwrite(vis_path, grid)
+                    vis_path = vis_dir / f"{base_name}_vis.jpg"
+                    cv2.imwrite(str(vis_path), grid)
                     print(f"Saved visualization to: {vis_path}")
                     
                     # Also save SMPLX mesh with contacts if requested
-                    smplx_path = os.path.join(vis_dir, f"{base_name}_smplx_with_contacts.obj")
+                    smplx_path = vis_dir / f"{base_name}_smplx_with_contacts.obj"
                     process_smplx_mesh_with_contacts(
                         pred_contact_3d_smplx,
-                        smplx_path,
+                        str(smplx_path),
                         contact_threshold=0.1,
                         gender='neutral'
                     )
