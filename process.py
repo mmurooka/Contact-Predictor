@@ -6,6 +6,7 @@ import shutil
 import joblib as jl
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import cv2
@@ -44,6 +45,11 @@ def parse_args(args):
     parser.add_argument('--resume', action='store_true', help='Reuse matching per-image results')
     parser.add_argument('--frame-indices', nargs='+', type=int,
                         help='Optional original numeric frame indices for a representative check')
+    parser.add_argument('--visual-encoder-batch-size',type=int,default=1,
+                        help='Independent canonical body views per SAM encoder batch')
+    parser.add_argument('--cache-canonical',action=argparse.BooleanOptionalAction,default=True,
+                        help='Reuse SAM embeddings of the identical canonical body renders')
+    parser.add_argument('--kv-cache',action='store_true',help='Cache autoregressive keys/values and concatenate final-layer states')
     parser.add_argument(
         "--precision",
         default="bf16",
@@ -111,6 +117,7 @@ def get_image_paths(base_dir):
 @torch.no_grad()
 def main(args):
     args = parse_args(args)
+    if args.visual_encoder_batch_size<1:raise ValueError('Visual encoder batch size must be positive')
     img_folder = os.path.join(args.base_dir, args.tgt_name)
     
     # Get all image paths
@@ -146,6 +153,9 @@ def main(args):
                      model_config_sha256=hashlib.sha256(model_config.read_bytes()).hexdigest(),
                      object_name=args.obj, prompt=args.prompt, precision=args.precision,
                      load_in_4bit=args.load_in_4bit, load_in_8bit=args.load_in_8bit)
+    signature['visual_encoder_batch_size']=args.visual_encoder_batch_size
+    signature['cache_canonical']=args.cache_canonical
+    if args.kv_cache:signature['kv_cache']=True
     crop_metadata = Path(img_folder)/'crop_metadata.json'
     if crop_metadata.is_file():
         crop = json.loads(crop_metadata.read_text())
@@ -262,6 +272,7 @@ def main(args):
     transform = ResizeLongestSide(args.image_size)
 
     model.eval()
+    model.visual_encoder_batch_size=args.visual_encoder_batch_size
 
     # Setup for human contact
     #camera_params_humans = HUMAN_VIEW_DICT[model.config.hC_sam_view_type]['cam_params']
@@ -275,6 +286,20 @@ def main(args):
     sam_image_paths_template = [f'{base_path}/body_render_norm_{view}.png' for view in view_names]
     overlay_sam_paths_template = [f'{base_path}/smplh_body_render_blue_{view}.png' for view in view_names]
     mask_color = (np.array([1.0, 0.15, 0.10]) * 255).astype(np.uint8)
+
+    # Canonical body renders and camera parameters are identical for every
+    # video frame. Only the actual RGB image and language conditioning change.
+    sam_image = [Image.open(sam_img) for sam_img in sam_image_paths_template]
+    sam_multiview = np.stack([np.asarray(sam_img) for sam_img in sam_image], axis=0)
+    valid_masks_region = [(sam_img.sum(axis=-1) < 255*3).astype(np.uint8) for sam_img in sam_multiview]
+    sam_multiview = [transform.apply_image(sam_img) for sam_img in sam_multiview]
+    resize_list = [sam_multiview[0].shape[:2]]
+    sam_multiview = torch.stack([preprocess(torch.from_numpy(sam_img).permute(2, 0, 1).contiguous()) for sam_img in sam_multiview])
+    sam_multiview = sam_multiview.unsqueeze(0).cuda().to(torch_dtype)
+    cam_params_curr = cam_params.to(torch_dtype)
+    canonical_embeddings=model.get_visual_embs(sam_multiview) if args.cache_canonical else None
+    print('Canonical SAM body views ready',flush=True)
+    torch.cuda.reset_peak_memory_stats()
 
     # Process each image
     for full_path, rel_path in image_paths:
@@ -323,29 +348,11 @@ def main(args):
         else:
             image_clip = image_clip.float()
 
-        # Prepare SAM multiview images
-        sam_image = [Image.open(sam_img) for sam_img in sam_image_paths_template]
-        sam_multiview = np.stack([np.asarray(sam_img) for sam_img in sam_image], axis=0)
-        valid_masks_region = [(sam_img.sum(axis=-1) < 255*3).astype(np.uint8) for sam_img in sam_multiview]
-        sam_multiview = [transform.apply_image(sam_img) for sam_img in sam_multiview]
-        resize_list = [sam_multiview[0].shape[:2]]
-        sam_multiview = torch.stack([preprocess(torch.from_numpy(sam_img).permute(2, 0, 1).contiguous()) for sam_img in sam_multiview])
-        sam_multiview = sam_multiview.unsqueeze(0).cuda()
-
-        if args.precision == "bf16":
-            sam_multiview = sam_multiview.bfloat16()
-            cam_params_curr = cam_params.bfloat16()
-        elif args.precision == "fp16":
-            sam_multiview = sam_multiview.half()
-            cam_params_curr = cam_params
-        else:
-            sam_multiview = sam_multiview.float()
-            cam_params_curr = cam_params
-
         input_ids = tokenizer_image_token(prompt_final, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
 
         # Run model
+        inference_start=time.perf_counter()
         output = model.evaluate(
             image_clip,
             sam_multiview,
@@ -357,11 +364,15 @@ def main(args):
             contact_type='hcontact-wScene',
             max_new_tokens=512,
             tokenizer=tokenizer,
+            image_embeddings=canonical_embeddings,
+            use_kv_cache=args.kv_cache,
         )
         
         output_ids, pred_masks = output["output_ids"], output["pred_masks"]
         pred_contact_3d = output["pred_contact_3d"].detach()
         pred_contact_3d_raw = output["pred_contact_3d_raw"].detach()
+        if not torch.isfinite(pred_contact_3d).all() or not torch.isfinite(pred_contact_3d_raw).all():
+            raise FloatingPointError(f'Nonfinite contact prediction for {rel_path}')
         
         # Decode text output
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
@@ -390,7 +401,9 @@ def main(args):
                 pred_contact_3d_raw_smplx=pred_contact_3d_raw_smplx.cpu()
                 )
         vert_path.with_suffix('.json').write_text(json.dumps(dict(
-            provenance=signatures[rel_path],response=text_output),indent=2))
+            provenance=signatures[rel_path],response=text_output,
+            inference_seconds=time.perf_counter()-inference_start,
+            peak_cuda_allocated_mib_to_date=torch.cuda.max_memory_allocated()/1024**2),indent=2))
         temporary_path.replace(vert_path)
         print(f"Saved vertices to: {vert_path}")
         

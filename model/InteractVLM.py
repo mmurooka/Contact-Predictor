@@ -253,7 +253,13 @@ class InteractVLMForCausalLM(LlavaLlamaForCausalLM):
             image_embeddings_list = []
             for i in range(pixel_values.shape[0]):
                 torch.cuda.empty_cache()
-                image_embeddings = self.model.visual_model.image_encoder(pixel_values[i])
+                # SAM uses per-image attention/LayerNorm, so splitting views
+                # preserves the computation without a four-view attention peak.
+                batch_size = getattr(self, 'visual_encoder_batch_size', pixel_values.shape[1])
+                image_embeddings = torch.cat([
+                    self.model.visual_model.image_encoder(chunk)
+                    for chunk in pixel_values[i].split(batch_size)
+                ], dim=0)
                 image_embeddings_list.append(image_embeddings)
             torch.cuda.empty_cache()
             image_embeddings = torch.stack(image_embeddings_list, dim=0)
@@ -521,17 +527,25 @@ class InteractVLMForCausalLM(LlavaLlamaForCausalLM):
         contact_type='hcontact',
         max_new_tokens=32,
         tokenizer=None,
+        image_embeddings=None,
+        use_kv_cache=False,
     ):
         with torch.no_grad():
             outputs = self.generate(
                 images=images_clip,
                 input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids) if use_kv_cache else None,
                 max_new_tokens=max_new_tokens,
                 num_beams=1,
                 output_hidden_states=True,
                 return_dict_in_generate=True,
+                use_cache=use_kv_cache,
             )
-            output_hidden_states = outputs.hidden_states[-1]
+            # This LLaVA fork returns the final-layer tensor (not all layers)
+            # at each generation step. Cached decoding emits the prompt once
+            # and then one new hidden state per step; concatenation restores
+            # exactly the sequence alignment used by the segmentation mask.
+            output_hidden_states = torch.cat(outputs.hidden_states,dim=1) if use_kv_cache else outputs.hidden_states[-1]
             output_ids = outputs.sequences
 
             seg_token_mask = torch.zeros_like(output_ids, dtype=torch.bool, device=output_ids.device)
@@ -577,7 +591,8 @@ class InteractVLMForCausalLM(LlavaLlamaForCausalLM):
                     tokens.append(None)
             pred_embeddings = pred_embeddings_
 
-            image_embeddings = self.get_visual_embs(images)
+            if image_embeddings is None:
+                image_embeddings = self.get_visual_embs(images)
 
             multimask_output = False
             pred_masks = []
@@ -588,7 +603,7 @@ class InteractVLMForCausalLM(LlavaLlamaForCausalLM):
                 pred_emb = pred_embeddings[i].unsqueeze(1)
                 if self.multiview_channels > 1:
                     pred_emb = pred_emb.repeat(1, self.multiview_channels, 1)
-                processed_embedding = self.process_embeddings(pred_emb, cam_params[i], tokens[i])
+                processed_embedding = self.process_embeddings(pred_emb, cam_params[i], tokens[i]).to(image_embeddings.dtype)
                 sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
                     points=None,
                     boxes=None,
