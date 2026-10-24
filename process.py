@@ -146,6 +146,13 @@ def main(args):
                      model_config_sha256=hashlib.sha256(model_config.read_bytes()).hexdigest(),
                      object_name=args.obj, prompt=args.prompt, precision=args.precision,
                      load_in_4bit=args.load_in_4bit, load_in_8bit=args.load_in_8bit)
+    crop_metadata = Path(img_folder)/'crop_metadata.json'
+    if crop_metadata.is_file():
+        crop = json.loads(crop_metadata.read_text())
+        if not crop.get('complete'):
+            raise ValueError('HOI crops are incomplete')
+        signature['source_video_sha256'] = crop['source_video_sha256']
+        signature['crop_metadata_sha256'] = hashlib.sha256(crop_metadata.read_bytes()).hexdigest()
     pending, signatures = [], {}
     for full_path, rel_path in image_paths:
         provenance = dict(signature, source_image_sha256=hashlib.sha256(Path(full_path).read_bytes()).hexdigest())
