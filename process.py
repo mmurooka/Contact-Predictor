@@ -4,6 +4,8 @@ import sys
 import glob
 import shutil
 import joblib as jl
+import hashlib
+import json
 from pathlib import Path
 
 import cv2
@@ -37,8 +39,11 @@ def parse_args(args):
 
     parser.add_argument("--prompt", default="Which body parts are in contact with the {object}? Segment these contact areas.",
                         type=str, help="Prompt template for human contact prediction")
-    parser.add_argument("--save_vis", action="store_true", default=True,
+    parser.add_argument("--save_vis", action=argparse.BooleanOptionalAction, default=True,
                         help="Whether to save visualization images")
+    parser.add_argument('--resume', action='store_true', help='Reuse matching per-image results')
+    parser.add_argument('--frame-indices', nargs='+', type=int,
+                        help='Optional original numeric frame indices for a representative check')
     parser.add_argument(
         "--precision",
         default="bf16",
@@ -103,12 +108,18 @@ def get_image_paths(base_dir):
     return sorted(image_paths)
 
 
+@torch.no_grad()
 def main(args):
     args = parse_args(args)
     img_folder = os.path.join(args.base_dir, args.tgt_name)
     
     # Get all image paths
     image_paths = get_image_paths(img_folder)
+    if args.frame_indices is not None:
+        requested = set(args.frame_indices)
+        image_paths = [(p,r) for p,r in image_paths if Path(p).stem.isdigit() and int(Path(p).stem) in requested]
+        if {int(Path(p).stem) for p,_ in image_paths} != requested:
+            raise ValueError('Requested frame indices are missing')
     if not image_paths:
         print("No images found in the specified directory")
         return
@@ -128,6 +139,34 @@ def main(args):
     vert_base.mkdir(parents=True, exist_ok=True)
     if args.save_vis:
         vis_base.mkdir(parents=True, exist_ok=True)
+
+    # Keep partial results useful after long-running inference is interrupted.
+    model_config = Path(args.version)/'config.json'
+    signature = dict(model_path=str(Path(args.version).resolve()),
+                     model_config_sha256=hashlib.sha256(model_config.read_bytes()).hexdigest(),
+                     object_name=args.obj, prompt=args.prompt, precision=args.precision,
+                     load_in_4bit=args.load_in_4bit, load_in_8bit=args.load_in_8bit)
+    pending, signatures = [], {}
+    for full_path, rel_path in image_paths:
+        provenance = dict(signature, source_image_sha256=hashlib.sha256(Path(full_path).read_bytes()).hexdigest())
+        signatures[rel_path] = provenance
+        result_path = (vert_base/rel_path).with_suffix('.npz')
+        metadata_path = result_path.with_suffix('.json')
+        if result_path.exists():
+            if not args.resume:
+                raise FileExistsError(f'{result_path}; use --resume for matching results')
+            if not metadata_path.exists() or json.loads(metadata_path.read_text()).get('provenance') != provenance:
+                raise ValueError(f'Existing output has different or missing provenance: {result_path}')
+            with np.load(result_path, allow_pickle=False) as result:
+                contact = result['pred_contact_3d_smplh']
+                if contact.size != 6890 or not np.isfinite(contact).all():
+                    raise ValueError(f'Invalid saved contact: {result_path}')
+            continue
+        pending.append((full_path, rel_path))
+    image_paths = pending
+    print(f'Pending images: {len(image_paths)}', flush=True)
+    if not image_paths:
+        return
 
     # Create model
     tokenizer = AutoTokenizer.from_pretrained(
@@ -336,12 +375,16 @@ def main(args):
         # Convert to SMPLX format
         pred_contact_3d_smplx = convert_contacts(pred_contact_3d, smpl_to_smlpx_mapping)
         pred_contact_3d_raw_smplx = convert_contacts(pred_contact_3d_raw, smpl_to_smlpx_mapping)
-        np.savez(str(vert_path),
+        temporary_path = vert_path.with_suffix('.tmp.npz')
+        np.savez(str(temporary_path),
                 pred_contact_3d_smplh=pred_contact_3d.cpu(),
                 pred_contact_3d_raw_smplh=pred_contact_3d_raw.cpu(),
                 pred_contact_3d_smplx=pred_contact_3d_smplx.cpu(),
                 pred_contact_3d_raw_smplx=pred_contact_3d_raw_smplx.cpu()
                 )
+        vert_path.with_suffix('.json').write_text(json.dumps(dict(
+            provenance=signatures[rel_path],response=text_output),indent=2))
+        temporary_path.replace(vert_path)
         print(f"Saved vertices to: {vert_path}")
         
         # Save visualization if requested
